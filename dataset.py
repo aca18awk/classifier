@@ -4,7 +4,7 @@ from typing import Literal
 from enum import Enum
 
 from torch import unsqueeze, from_numpy, empty, Tensor
-from torch.utils.data import Dataset, ConcatDataset
+from torch.utils.data import Dataset, ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 from skimage.io import imread
@@ -14,7 +14,8 @@ import numpy as np
 import numbers
 import matplotlib.pyplot as plt
 from torchvision.utils import save_image
-
+from typing import Literal, Dict, Optional
+from collections import Counter
 
 DatasetSplit = Literal["test", "train", "validation"]
 
@@ -70,40 +71,70 @@ class GammaCorrectionTransform:
             img = TF.adjust_gamma(img, gamma_factor, gain=1)
         return img
 
-
-
-transform_pipe = transforms.Compose([
-    transforms.ToPILImage(), # Convert np array to PILImage
-    
-    # Resize image to 224 x 224 as required by most vision models
-    transforms.Resize(
-        size=(224, 224)
-    ),
-    
-    # Convert PIL image to tensor with image values in [0, 1]
-    transforms.ToTensor(),
-    
-    # transforms.Normalize(
-    #     mean=[0.485, 0.456, 0.406],
-    #     std=[0.229, 0.224, 0.225]
-    # ),
-])
-
 class GlaucomaHarvardDataset(Dataset):
-    def __init__(self, purpose:DatasetSplit = "test", transform = None, augmentation = True, gen_data_path=None):
-        data_path = os.path.join(path,purpose)
+    def __init__(
+        self, 
+        purpose: DatasetSplit = "test", 
+        transform = None, 
+        augmentation = True, 
+        gen_data_path = None,
+        gen_counts: Optional[Dict[str, int]] = None
+    ):
+        """
+        Args:
+            gen_data_path: Path to the generated images root folder.
+            gen_counts: Dictionary specifying how many images to take per class.
+                        Example: {'normal_control': 20, 'early_glaucoma': 10}
+                        If a class is missing from dict, 0 images are added for that class.
+        """
+        data_path = os.path.join(path, purpose)
+        
+        # 1. Load Real Data
         real_data = ImageFolder(data_path, transform=transform)
         self._classes = real_data.classes
         self._class_to_idx = real_data.class_to_idx
         self.do_augment = augmentation
         
-        data = [real_data]
-        if gen_data_path is None:
+        datasets_to_concat = [real_data]
+
+        # 2. Load and Filter Generated Data
+        if gen_data_path is None or gen_counts is None:
             self.data = real_data
         else:
-            generated_data = ImageFolder(gen_data_path, transform=transform)
-            data.append(generated_data)
-            self.data = ConcatDataset(data)
+            full_gen_dataset = ImageFolder(gen_data_path, transform=transform)
+            
+            indices_to_include = []
+            
+            # ImageFolder.targets contains the list of class indices for every image
+            # We convert targets to a numpy array for easier indexing
+            all_targets = np.array(full_gen_dataset.targets)
+            
+            for class_name, count in gen_counts.items():
+                if count <= 0:
+                    continue
+                
+                # Get the integer label for the class name
+                if class_name in full_gen_dataset.class_to_idx:
+                    class_idx = full_gen_dataset.class_to_idx[class_name]
+                    
+                    # Find all indices in the dataset that match this class
+                    class_indices = np.where(all_targets == class_idx)[0]
+                    
+                    # Select the top N indices (or all if count > available)
+                    selected_indices = class_indices[:count]
+                    indices_to_include.extend(selected_indices)
+                else:
+                    print(f"Warning: Class '{class_name}' found in gen_counts but not in generated dataset folder.")
+
+            if len(indices_to_include) > 0:
+                # Create a subset with only the selected indices
+                gen_subset = Subset(full_gen_dataset, indices_to_include)
+                datasets_to_concat.append(gen_subset)
+                print(f"Added {len(indices_to_include)} generated images to the dataset.")
+            else:
+                print("No generated images added (gen_counts resulted in 0 samples).")
+
+            self.data = ConcatDataset(datasets_to_concat)
 
         # photometric data augmentation
         self.photometric_augment = T.Compose([
@@ -122,10 +153,7 @@ class GlaucomaHarvardDataset(Dataset):
 
         self.processing_normalize = T.Compose([
             T.ToTensor(),
-            T.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
+            # T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))but
         ])
         
 
@@ -155,16 +183,82 @@ class GlaucomaHarvardDataset(Dataset):
     @property
     def id_to_classes(self):
         return {v: k for k, v in self._class_to_idx.items()}
-    
 
-transform = transforms.Compose([
-    transforms.Resize([128, 128]),
-    transforms.ToTensor()
-])
-dataset1 = GlaucomaHarvardDataset("train", transform=transform)
-# print(dataset1.__len__())
-# dataset1.classes
-print(dataset1.id_to_classes)
+    def len_per_class(self):
+        """
+        Returns a dictionary with the count of samples per class.
+        Handles ImageFolder, ConcatDataset, and Subset.
+        """
+        all_targets = []
+
+        def get_targets_from_dataset(ds):
+            """Helper to extract targets recursively from different dataset types."""
+            if isinstance(ds, Subset):
+                # If it's a Subset, we must map the indices to the parent's targets
+                if hasattr(ds.dataset, 'targets'):
+                    # Access parent targets using the subset's indices
+                    # Note: ImageFolder targets are usually a list
+                    return [ds.dataset.targets[i] for i in ds.indices]
+            
+            elif hasattr(ds, 'targets'):
+                # Standard ImageFolder case
+                return ds.targets
+            
+            return []
+
+        # Main logic to aggregate targets
+        if isinstance(self.data, ConcatDataset):
+            for ds in self.data.datasets:
+                all_targets.extend(get_targets_from_dataset(ds))
+        else:
+            all_targets.extend(get_targets_from_dataset(self.data))
+
+        # Count occurrences
+        counts = Counter(all_targets)
+
+        # Map class indices to class names
+        class_counts = {
+            self.id_to_classes[idx]: count 
+            for idx, count in counts.items()
+        }
+        
+        # Ensure all classes are present (even if count is 0)
+        for class_name in self.classes:
+            if class_name not in class_counts:
+                class_counts[class_name] = 0
+
+        return class_counts
+
+# transform = transforms.Compose([
+#     transforms.Resize([128, 128]),
+#     transforms.ToTensor()
+# ])
+# dataset1 = GlaucomaHarvardDataset("train", transform=transform)
+# # print(dataset1.__len__())
+# # dataset1.classes
+# print(dataset1.id_to_classes)
+# counts = dataset1.len_per_class()
+# print("Counts per class:", counts)
+
+# gen_path = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/2025/Nov_3_conditional_model/with_classifer_10'
+
+# # Experiment 1: Specific mix
+# counts_exp_1 = {
+#     "early_glaucoma": 10,
+#     "normal_control": 20,
+#     "advanced_glaucoma": 15
+# }
+
+# dataset_exp1 = GlaucomaHarvardDataset(
+#     purpose="train", 
+#     augmentation=True,
+#     gen_data_path=gen_path,
+#     gen_counts=counts_exp_1
+# )
+
+# print(f"Total dataset size: {len(dataset_exp1)}")
+# counts = dataset_exp1.len_per_class()
+# print("Counts per class:", counts)
 
 
 # image, label = dataset1.__getitem__(0)
@@ -174,6 +268,19 @@ print(dataset1.id_to_classes)
 # save_image(image, output_path)
 # print(f"Image saved to {output_path}")
 
+
+
+transform_pipe = transforms.Compose([
+    transforms.ToPILImage(), # Convert np array to PILImage
+    transforms.Resize(
+        size=(224, 224)
+    ),
+    transforms.ToTensor(),
+    # transforms.Normalize(
+    #     mean=[0.485, 0.456, 0.406],
+    #     std=[0.229, 0.224, 0.225]
+    # ),
+])
 
 # MORE MANUAL DEFINITION
 class GlaucomaHarvardDatasetOld(Dataset):

@@ -16,9 +16,6 @@ from custom_model import GlaucomaClassifier
 import torch.optim.lr_scheduler as lr_scheduler
 import wandb
 
-AI_gen = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/2025/Nov_3_conditional_model/with_classifer_10'
-
-
 # CONSTANTS
 parser = argparse.ArgumentParser()
 parser.add_argument("--learning_rate", default=0.001)
@@ -33,10 +30,21 @@ learning_rate = float(config["learning_rate"])
 num_epoch = int(config["num_epoch"])
 model_name = config["model_name"]
 
-output_dir = os.path.join("outputs", model_name, "21_Nov_augmented_data-linear_auc")
+output_dir = os.path.join("outputs", model_name, "25_Nov_gen_data_2")
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
+AI_DATA_PATH = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/25_Nov/lunar-shadow-27_GS_1.0'
+AMOUNT_ADDED_PERCENT = 0.003
+AMOUNT_ADDED = int(AMOUNT_ADDED_PERCENT * 1079)
+count_early = int(0.2 * AMOUNT_ADDED)
+count_normal = int(0.3 * AMOUNT_ADDED)
+count_advanced = AMOUNT_ADDED - (count_early + count_normal)
+counts_exp_1 = {
+    "early_glaucoma": count_early,
+    "normal_control": count_normal,
+    "advanced_glaucoma": count_advanced
+}
 
 logger =  wandb.init(
                 project="classifier_train_fixed",
@@ -45,23 +53,37 @@ logger =  wandb.init(
                     "epoch": num_epoch,
                     "model_name": model_name,
                     "learning_rate": learning_rate,
-                    "augmented_data_path": None
+                    # "augmented_data_path": AI_DATA_PATH,
+                    # "ratio of data added": AMOUNT_ADDED_PERCENT,
+                    # "exact numbers added": counts_exp_1
                 },
                 resume="allow",
             )
 
+run_name = logger.name 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("device: ", device)
 
 
 transform = transforms.Compose([
-    transforms.Resize([128, 128]),
-    transforms.ToTensor()
+    transforms.Resize([299, 299]),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
 
-train_dataset = GlaucomaHarvardDataset("train", transform)
-test_dataset = GlaucomaHarvardDataset("test", transform, augmentation=False)
-val_dataset = GlaucomaHarvardDataset("validation", transform, augmentation=False)
+transform1 = transforms.Compose([
+    transforms.Resize([299, 299]),
+    transforms.ToTensor(),
+    transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+    )
+])
+
+# train_dataset = GlaucomaHarvardDataset("train", transform1, gen_counts=counts_exp_1, gen_data_path=AI_DATA_PATH)
+train_dataset = GlaucomaHarvardDataset("train", transform1, augmentation=False)
+test_dataset = GlaucomaHarvardDataset("test", transform1, augmentation=False)
+val_dataset = GlaucomaHarvardDataset("validation", transform1, augmentation=False)
 
 print(train_dataset.id_to_classes)
 
@@ -77,11 +99,17 @@ for images, labels in train_loader:
     break
 
 
-model = GlaucomaClassifier()
+model = GlaucomaClassifier(model_name=model_name)
 model.to(device)
 
 example_out = model(images)
 print(example_out.shape)
+
+print("Running Shape Check...")
+dummy_input = torch.randn(2, 3, 299, 299).to(device) # Batch of 2 images
+dummy_output = model(dummy_input)
+print(f"Input shape: {dummy_input.shape}")
+print(f"Output shape: {dummy_output.shape}")
 
 
 # training script
@@ -90,7 +118,7 @@ print("training phase: ")
 criterion = nn.CrossEntropyLoss() # loss function
 # optimizer = optim.Adam(model.parameters(), lr=learning_rate) # learning rate is constant. Can add learning rate scheduler later
 
-optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
 print("lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.5, total_iters=30)")
 scheduler = lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.5, total_iters=30)
 # scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
@@ -101,7 +129,7 @@ train_losses, val_losses = [], []
 best_val_loss = float('inf') # <--- FIXED
 best_model = None
 best_epoch = 0
-best_model_auc = None
+best_model_auc = 0
 best_epoch_auc = 0
 best_val_auc = 0
 for epoch in range(num_epoch):
@@ -153,30 +181,30 @@ for epoch in range(num_epoch):
             val_preds.append(outputs.cpu()) 
             val_trgts.append(labels.cpu())
     
-    val_loss = running_loss / val_dataset.__len__()
-    val_losses.append(val_loss)
-    
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        best_model = model.state_dict() # <--- This ensures best_model is not None
-        best_epoch = epoch
+        val_loss = running_loss / val_dataset.__len__()
+        val_losses.append(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model = model.state_dict() # <--- This ensures best_model is not None
+            best_epoch = epoch
 
-    val_preds = torch.cat(val_preds, dim=0)
-    val_trgts = torch.cat(val_trgts, dim=0) 
-    auc_val = auroc(val_preds, val_trgts, num_classes=3, average='macro', task='multiclass').item()
-    if auc_val > best_val_auc:
-        best_val_auc = auc_val
-        best_model_auc = model.state_dict()
-        best_epoch_auc= epoch
+        val_preds = torch.cat(val_preds, dim=0)
+        val_trgts = torch.cat(val_trgts, dim=0) 
+        auc_val = auroc(val_preds, val_trgts, num_classes=3, average='macro', task='multiclass').item()
+        if auc_val > best_val_auc:
+            best_val_auc = auc_val
+            best_model_auc = model.state_dict()
+            best_epoch_auc= epoch
 
     logger.log({"epoch":epoch, "val_loss":val_loss, "train_loss":train_loss, "lr":after_lr, "auc": auc, "auc_val":auc_val})
     
 
     print(f"Epoch {epoch+1}/{num_epoch} - Train loss: {train_loss}, Validation loss: {val_loss}")
 
-torch.save(model.state_dict(), os.path.join(output_dir, f"{model_name}_last.pth"))
-torch.save(best_model, os.path.join(output_dir, f"{model_name}_{best_epoch}_best_.pth"))
-torch.save(best_model_auc, os.path.join(output_dir, f"{model_name}_{best_epoch_auc}_best_auc.pth"))
+torch.save(model.state_dict(), os.path.join(output_dir, f"{run_name}_data_{AMOUNT_ADDED_PERCENT}_last.pth"))
+torch.save(best_model, os.path.join(output_dir, f"{run_name}_{best_epoch}_data_{AMOUNT_ADDED_PERCENT}_best_.pth"))
+torch.save(best_model_auc, os.path.join(output_dir, f"{run_name}_{best_epoch_auc}_data_{AMOUNT_ADDED_PERCENT}_best_auc.pth"))
 
 
 plt.plot(train_losses, label='Training loss')
