@@ -1,39 +1,39 @@
 import os
 
 from typing import Literal
-from enum import Enum
 
-from torch import unsqueeze, from_numpy, empty, Tensor
+from torch import empty
 from torch.utils.data import Dataset, ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
-from torchvision import transforms
-from skimage.io import imread
 import torchvision.transforms.v2 as T
 import torchvision.transforms.functional as TF
 import numpy as np
 import numbers
-import matplotlib.pyplot as plt
-from torchvision.utils import save_image
 from typing import Literal, Dict, Optional
 from collections import Counter
 
-DatasetSplit = Literal["test", "train", "validation"]
-
-class DatasetClass(Enum):
-    normal_control = 0
-    early_glaucoma = 1
-    advanced_glaucoma = 2
 
 path = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/'
+DatasetSplit = Literal["test", "train", "validation"]
 
-AI_gen = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/2025/Nov_3_conditional_model/with_classifer_10'
-
-# torch randaugment - do standard augmentations
-#  colour, spatial rotations, not crazy rotations
-# track macro AUC in torch metrics 
-# early stopping based on AUC - save the best model based on that
-# H-VAE, different diffusion models
-# (common diffusion model, Flow matching model)
+MODEL_SPECS = {
+    "efficientnet_b0": {
+        "size": (224, 224),
+        "mean": [0.485, 0.456, 0.406],
+        "std":  [0.229, 0.224, 0.225]
+    },
+    "inception_v3.tv_in1k": {
+        "size": (299, 299),
+        "mean": [0.5, 0.5, 0.5],
+        "std":  [0.5, 0.5, 0.5]
+    },
+    # Default fallback
+    "default": {
+        "size": (224, 224),
+        "mean": [0.485, 0.456, 0.406],
+        "std":  [0.229, 0.224, 0.225]
+    }
+}
 
 class GammaCorrectionTransform:
     """Apply Gamma Correction to the image"""
@@ -75,7 +75,7 @@ class GlaucomaHarvardDataset(Dataset):
     def __init__(
         self, 
         purpose: DatasetSplit = "test", 
-        transform = None, 
+        model_name: str = "efficientnet_b0",
         augmentation = True, 
         gen_data_path = None,
         gen_counts: Optional[Dict[str, int]] = None
@@ -87,27 +87,41 @@ class GlaucomaHarvardDataset(Dataset):
                         Example: {'normal_control': 20, 'early_glaucoma': 10}
                         If a class is missing from dict, 0 images are added for that class.
         """
+        # 1. Setup Model Specifics
+        specs = MODEL_SPECS.get(model_name, MODEL_SPECS["default"])
+        self.target_size = specs["size"]
+        self.mean = specs["mean"]
+        self.std = specs["std"]
+        
+        # This transform is applied by ImageFolder immediately on load.
+        # WE ONLY RESIZE HERE. We do NOT Normalize or ToTensor yet.
+        self.base_transform = T.Compose([
+            T.Resize(self.target_size),
+        ])
+
+        
         data_path = os.path.join(path, purpose)
         
         # 1. Load Real Data
-        real_data = ImageFolder(data_path, transform=transform)
+        real_data = ImageFolder(data_path, transform=self.base_transform)
         self._classes = real_data.classes
         self._class_to_idx = real_data.class_to_idx
         self.do_augment = augmentation
-        
-        datasets_to_concat = [real_data]
 
-        # 2. Load and Filter Generated Data
         if gen_data_path is None or gen_counts is None:
             self.data = real_data
+
+        # 2. Load and Filter Generated Data
         else:
-            full_gen_dataset = ImageFolder(gen_data_path, transform=transform)
+            datasets_to_concat = [real_data]
+            full_gen_dataset = ImageFolder(gen_data_path, transform=self.base_transform)
             
             indices_to_include = []
             
             # ImageFolder.targets contains the list of class indices for every image
             # We convert targets to a numpy array for easier indexing
             all_targets = np.array(full_gen_dataset.targets)
+            print(all_targets)
             
             for class_name, count in gen_counts.items():
                 if count <= 0:
@@ -127,7 +141,6 @@ class GlaucomaHarvardDataset(Dataset):
                     print(f"Warning: Class '{class_name}' found in gen_counts but not in generated dataset folder.")
 
             if len(indices_to_include) > 0:
-                # Create a subset with only the selected indices
                 gen_subset = Subset(full_gen_dataset, indices_to_include)
                 datasets_to_concat.append(gen_subset)
                 print(f"Added {len(indices_to_include)} generated images to the dataset.")
@@ -151,9 +164,10 @@ class GlaucomaHarvardDataset(Dataset):
             # T.RandomApply(transforms=[T.RandomResizedCrop(scale=(0.8, 1.0), size=image_size)], p=0.5),
         ])
 
-        self.processing_normalize = T.Compose([
+        # Final Normalization (Always Applied)
+        self.final_transform = T.Compose([
             T.ToTensor(),
-            # T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))but
+            T.Normalize(mean=self.mean, std=self.std)
         ])
         
 
@@ -161,20 +175,17 @@ class GlaucomaHarvardDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, index):
-        if not self.do_augment:
-            return self.data[index]
-        else:
-            image, label = self.data[index]
-            
-            # Apply Augmentations
-            # image = self.photometric_augment(image) # Uncomment if needed
+        # image is PIL because ImageFolder used only Resize
+        image, label = self.data[index] 
+        
+        if self.do_augment:
+            image = self.photometric_augment(image)
             image = self.geometric_augment(image)
+        
+        # Always normalize at the very end
+        image = self.final_transform(image)
             
-            if not isinstance(image, Tensor):
-                 image = T.ToTensor()(image)
-                 
-            image = self.processing_normalize(image)
-            return (image, label)
+        return (image, label)
     
     @property
     def classes(self):
@@ -228,109 +239,26 @@ class GlaucomaHarvardDataset(Dataset):
                 class_counts[class_name] = 0
 
         return class_counts
+    
 
-# transform = transforms.Compose([
-#     transforms.Resize([128, 128]),
-#     transforms.ToTensor()
-# ])
-# dataset1 = GlaucomaHarvardDataset("train", transform=transform)
-# # print(dataset1.__len__())
-# # dataset1.classes
-# print(dataset1.id_to_classes)
-# counts = dataset1.len_per_class()
-# print("Counts per class:", counts)
+
+# Experiment 1: Specific mix
 
 # gen_path = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/2025/Nov_3_conditional_model/with_classifer_10'
-
-# # Experiment 1: Specific mix
 # counts_exp_1 = {
 #     "early_glaucoma": 10,
 #     "normal_control": 20,
 #     "advanced_glaucoma": 15
 # }
 
-# dataset_exp1 = GlaucomaHarvardDataset(
-#     purpose="train", 
-#     augmentation=True,
-#     gen_data_path=gen_path,
-#     gen_counts=counts_exp_1
-# )
+dataset_exp1 = GlaucomaHarvardDataset(
+    purpose="train", 
+    augmentation=False,
+    # gen_data_path=gen_path,
+    # gen_counts=counts_exp_1
+)
 
-# print(f"Total dataset size: {len(dataset_exp1)}")
-# counts = dataset_exp1.len_per_class()
-# print("Counts per class:", counts)
-
-
-# image, label = dataset1.__getitem__(0)
-# print(image)
-# # Save the image to a file
-# output_path = os.path.join("outputs", "output_image.png")
-# save_image(image, output_path)
-# print(f"Image saved to {output_path}")
-
-
-
-transform_pipe = transforms.Compose([
-    transforms.ToPILImage(), # Convert np array to PILImage
-    transforms.Resize(
-        size=(224, 224)
-    ),
-    transforms.ToTensor(),
-    # transforms.Normalize(
-    #     mean=[0.485, 0.456, 0.406],
-    #     std=[0.229, 0.224, 0.225]
-    # ),
-])
-
-# MORE MANUAL DEFINITION
-class GlaucomaHarvardDatasetOld(Dataset):
-    """
-    Dataset class needs to have those 3 methods overwritten
-    init - what to do when dataset is created
-    len - model needs to know how big is the dataset
-    getitem - to get specific item by using an id
-    """
-    
-    def __init__(self, purpose:DatasetSplit = "test", transform=transform_pipe):
-
-        dataPath = os.path.join(path,purpose)
-
-        files = []
-        labels = []
-        for datasetClass in DatasetClass: 
-            folderPath = os.path.join(dataPath, datasetClass.name)
-
-            newfiles = [os.path.join(folderPath, filename) for filename in os.listdir(folderPath) if filename.endswith(".png")]
-            files += newfiles
-            labels += [datasetClass.value] * len(newfiles)
-        
-        self.images = files
-        self.labels = labels
-            
-        self.transform = transform
-        
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-
-        img = imread(img_path)
-        
-        if self.transform:
-            img = self.transform(img)
-            img = unsqueeze(img, 0)
-        
-        sample = {
-            "image": img,
-            "label": self.labels[idx],
-            "id": os.path.basename(self.images[idx]).replace(".png", "")
-        }
-
-        return sample
-    
-    def __len__(self):
-        return len(self.images)
-
-
-
-# dataset = GlaucomaHarvardDataset("test")
-# dataset.__getitem__(1)
-# dataset.__len__()
+print(f"Total dataset size: {len(dataset_exp1)}")
+counts = dataset_exp1.len_per_class()
+print("Counts per class:", counts)
+print(dataset_exp1[1])
