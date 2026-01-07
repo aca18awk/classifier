@@ -40,9 +40,9 @@ augment_with_ai = config["augment_with_ai"]
 augment = config["augment"]
 
 if augment_with_ai:
-    ai_data_path = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/25_Nov/lunar-shadow-27_GS_5.0'
-    AMOUNT_ADDED_PERCENT = 5
-    AMOUNT_ADDED = int(AMOUNT_ADDED_PERCENT * 1079)
+    ai_data_path = '/vol/biomedic3/awk24/datasets/Glaucoma_fundus/generated/18_Dec/fluent-morning-29_GS_20.0'
+    AMOUNT_ADDED_PERCENT = 10
+    AMOUNT_ADDED = int(0.01 * AMOUNT_ADDED_PERCENT * 1079)
     count_early = int(0.2 * AMOUNT_ADDED)
     count_normal = int(0.3 * AMOUNT_ADDED)
     count_advanced = AMOUNT_ADDED - (count_early + count_normal)
@@ -56,12 +56,16 @@ else:
     ai_data_path = None
     counts = None
 
-output_dir = os.path.join("outputs2", model_name, f"26_Nov_gen_data_{AMOUNT_ADDED_PERCENT}")
+output_dir = os.path.join("outputs2", model_name, f"18_Dec_gen_data_{AMOUNT_ADDED_PERCENT}")
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
+
+experiment_group_name = f"18_Dec_gen_data_{AMOUNT_ADDED_PERCENT}"
+
 for i in range(5):
     logger =  wandb.init(
                     project="classifier_train_experiments",
+                    group=experiment_group_name,
                     config={
                         "epoch": num_epoch,
                         "model_name": model_name,
@@ -195,3 +199,5 @@ for i in range(5):
         torch.save(best_model, os.path.join(output_dir, f"{run_name}_{best_epoch}_data_{AMOUNT_ADDED_PERCENT}_best_loss.pth"))
     if best_model_auc is not None:
         torch.save(best_model_auc, os.path.join(output_dir, f"{run_name}_{best_epoch_auc}_data_{AMOUNT_ADDED_PERCENT}_best_auc.pth"))
+    
+    wandb.finish()
