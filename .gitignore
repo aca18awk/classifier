@@ -1,5 +1,5 @@
 outputs/
-outputs2/
+outputs*/
 run_logs/
 wandb/
 __pycache__/
