@@ -1,0 +1,6 @@
+outputs/
+outputs*/
+run_logs/
+wandb/
+__pycache__/
+*.xlsx
