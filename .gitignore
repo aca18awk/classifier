@@ -4,3 +4,5 @@ run_logs/
 wandb/
 __pycache__/
 *.xlsx
+data/
+results/

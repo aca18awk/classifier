@@ -1,6 +1,8 @@
 from torch.utils.data import Dataset, ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
-import torchvision.transforms.v2 as T
+# import torchvision.transforms.v2 as T
+from torchvision import transforms
+
 from collections import Counter
 
 
@@ -30,7 +32,7 @@ class GeneratedGlaucomaDataset(Dataset):
         self.mean = specs["mean"]
         self.std = specs["std"]
         
-        self.base_transform = T.Compose([T.Resize(self.target_size)])
+        self.base_transform = transforms.Compose([transforms.Resize(self.target_size)])
         raw_data = ImageFolder(path, transform=self.base_transform)
 
         # --- Label Mapping Logic ---
@@ -51,9 +53,9 @@ class GeneratedGlaucomaDataset(Dataset):
         indices = [i for i, label in enumerate(raw_data.targets) if label in self.label_map]
         self.data = Subset(raw_data, indices)
 
-        self.final_transform = T.Compose([
-            T.ToTensor(),
-            T.Normalize(mean=self.mean, std=self.std)
+        self.final_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=self.mean, std=self.std)
         ])
         
     def __len__(self):
